@@ -1,6 +1,7 @@
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import argparse
 
 
 def get_service_name(port):
@@ -22,30 +23,26 @@ def scan_port(host, port, timeout=1):
         return port, False
 
 
-def validate_input(target, start_port, end_port, timeout):
-    """Валидировать входные данные."""
-    if not target:
-        raise ValueError("Хост не может быть пустым.")
-
-    if start_port < 1 or start_port > 65535:
-        raise ValueError("Начальный порт должен быть от 1 до 65535.")
-
-    if end_port < 1 or end_port > 65535:
-        raise ValueError("Конечный порт должен быть от 1 до 65535.")
-
-    if start_port > end_port:
-        raise ValueError("Начальный порт не может быть больше конечного.")
-
-    if timeout <= 0:
-        raise ValueError("Таймаут должен быть положительным числом.")
-
-    return True
-
-
-def print_progress(current, total):
-    """Вывести индикатор прогресса."""
-    percent = (current / total) * 100
-    print(f"\r[{percent:.1f}%] ({current}/{total})", end="", flush=True)
+def parse_ports(ports_str):
+    """Парсинг аргумента --ports."""
+    if ports_str == "all":
+        return list(range(1, 65536))
+    elif '-' in ports_str:
+        try:
+            start, end = map(int, ports_str.split('-'))
+            if start < 1 or end > 65535 or start > end:
+                raise ValueError
+            return list(range(start, end + 1))
+        except ValueError:
+            raise ValueError(f"Неверный диапазон портов: {ports_str}. Используйте формат start-end, например 1-1000")
+    else:
+        try:
+            ports = [int(p.strip()) for p in ports_str.split(',')]
+            if any(p < 1 or p > 65535 for p in ports):
+                raise ValueError
+            return ports
+        except ValueError:
+            raise ValueError(f"Неверный список портов: {ports_str}. Используйте формат port1,port2,port3, например 80,443,22")
 
 
 def resolve_target(target):
@@ -56,13 +53,26 @@ def resolve_target(target):
         raise ValueError(f"Не удалось определить хост '{target}': {err}")
 
 
-def scan_ports(target, start_port, end_port, num_threads=50, timeout=1):
-    """Сканирование диапазона портов, возвращает список открытых портов."""
-    validate_input(target, start_port, end_port, timeout)
+def print_progress(current, total, start_time):
+    """Вывести улучшенный индикатор прогресса."""
+    percent = (current / total) * 100
+    elapsed = time.time() - start_time
+    eta = (elapsed / current) * (total - current) if current > 0 else 0
+    
+    # Визуальный бар
+    bar_length = 30
+    filled = int(bar_length * percent / 100)
+    bar = '█' * filled + '░' * (bar_length - filled)
+    
+    print(f"\r[{bar}] {percent:.1f}% ({current}/{total}) | Время: {elapsed:.1f}с | ETA: {eta:.1f}с", end="", flush=True)
+
+
+def scan_ports(target, ports_list, num_threads=50, timeout=1):
+    """Сканирование списка портов, возвращает список открытых портов."""
     ip = resolve_target(target)
 
     num_threads = max(1, min(num_threads, 256))
-    total_ports = end_port - start_port + 1
+    total_ports = len(ports_list)
 
     open_ports = []
     scanned = 0
@@ -75,7 +85,7 @@ def scan_ports(target, start_port, end_port, num_threads=50, timeout=1):
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = {
             executor.submit(scan_port, ip, port, timeout): port
-            for port in range(start_port, end_port + 1)
+            for port in ports_list
         }
 
         for future in as_completed(futures):
@@ -83,11 +93,9 @@ def scan_ports(target, start_port, end_port, num_threads=50, timeout=1):
             port, is_open = future.result()
 
             if is_open:
-                service = get_service_name(port)
-                print(f"[OPEN] Порт {port:5d} | {service:15s}")
                 open_ports.append(port)
 
-            print_progress(scanned, total_ports)
+            print_progress(scanned, total_ports, start_time)
 
     elapsed_time = time.time() - start_time
     print("\n\nСканирование завершено.")
@@ -109,14 +117,28 @@ def print_scan_results(open_ports):
 
 
 def main():
-    try:
-        target = input("Введите IP или хост (по умолчанию localhost): ").strip() or "localhost"
-        start_port = int(input("Начальный порт (по умолчанию 1): ") or "1")
-        end_port = int(input("Конечный порт (по умолчанию 1000): ") or "1000")
-        num_threads = int(input("Количество потоков (по умолчанию 50): ") or "50")
-        timeout = float(input("Таймаут (сек, по умолчанию 1.0): ") or "1.0")
+    parser = argparse.ArgumentParser(description="Многопоточный TCP-сканер портов")
+    parser.add_argument("--host", default="localhost", help="IP или хост для сканирования (по умолчанию: localhost)")
+    parser.add_argument("--ports", default="1-1000", help="Диапазон или список портов: диапазон (1-1000), список (80,443,22) или all (по умолчанию: 1-1000)")
+    parser.add_argument("--threads", type=int, default=50, help="Количество потоков (по умолчанию: 50)")
+    parser.add_argument("--timeout", type=float, default=1.0, help="Таймаут в секундах (по умолчанию: 1.0)")
 
-        open_ports = scan_ports(target, start_port, end_port, num_threads, timeout)
+    args = parser.parse_args()
+
+    # Парсинг портов
+    try:
+        ports_list = parse_ports(args.ports)
+    except ValueError as err:
+        parser.error(str(err))
+
+    # Валидация других аргументов
+    if args.threads < 1:
+        parser.error("Количество потоков должно быть положительным")
+    if args.timeout <= 0:
+        parser.error("Таймаут должен быть положительным")
+
+    try:
+        open_ports = scan_ports(args.host, ports_list, args.threads, args.timeout)
         print_scan_results(open_ports)
     except KeyboardInterrupt:
         print("\nСканирование прервано пользователем.")
